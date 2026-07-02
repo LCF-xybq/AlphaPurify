@@ -2548,17 +2548,17 @@ class FactorAnalyzer():
         layout_updates = base_layout.copy()
         layout_updates.update(legend_layouts)
         fig.update_layout(**layout_updates)
+        if return_fig:
+            return fig
         if staticPlot:
             fig.show(
                 config={
-                    "staticPlot": True, 
+                    "staticPlot": True,
                     "responsive": True
                 }
             )
         else:
             fig.show(config={"responsive": True})
-        if return_fig:
-            return fig
     
     def create_long_short_return_sheet(self, staticPlot:bool=False, return_fig:bool=False):
         r"""
@@ -2887,17 +2887,17 @@ class FactorAnalyzer():
         layout_updates = base_layout.copy()
         layout_updates.update(legend_layouts)
         fig.update_layout(**layout_updates)
+        if return_fig:
+            return fig
         if staticPlot:
             fig.show(
                 config={
-                    "staticPlot": True, 
+                    "staticPlot": True,
                     "responsive": True
                 }
             )
         else:
             fig.show(config={"responsive": True})
-        if return_fig:
-            return fig
            
     def create_single_fac_ic_sheet(self, staticPlot:bool=False, return_fig:bool=False):
         r"""
@@ -3322,17 +3322,17 @@ class FactorAnalyzer():
         layout_updates = base_layout.copy()
         layout_updates.update(legend_layouts)
         fig.update_layout(**layout_updates)
+        if return_fig:
+            return fig
         if staticPlot:
             fig.show(
                 config={
-                    "staticPlot": True, 
+                    "staticPlot": True,
                     "responsive": True
                 }
             )
         else:
             fig.show(config={"responsive": True})
-        if return_fig:
-            return fig
     
     def create_short_return_sheet(self, staticPlot:bool=False, return_fig:bool=False):
         r"""
@@ -3735,17 +3735,17 @@ class FactorAnalyzer():
         layout_updates = base_layout.copy()
         layout_updates.update(legend_layouts)
         fig.update_layout(**layout_updates)
+        if return_fig:
+            return fig
         if staticPlot:
             fig.show(
                 config={
-                    "staticPlot": True, 
+                    "staticPlot": True,
                     "responsive": True
                 }
             )
         else:
             fig.show(config={"responsive": True})
-        if return_fig:
-            return fig
 
     def create_single_fac_full_sheet(self, staticPlot:bool=False, return_fig:bool=False):
         self.create_single_fac_ic_sheet(staticPlot,return_fig)
@@ -4137,20 +4137,19 @@ class FactorAnalyzer():
             showlegend=False
         )
         fig.update_layout(base_layout)
-        
+
+        if return_fig:
+            return fig, df_ori
+
         if staticPlot:
             fig.show(
                 config={
-                    "staticPlot": True, 
+                    "staticPlot": True,
                     "responsive": True
                 }
             )
         else:
             fig.show(config={"responsive": True})
-        
-        if return_fig:
-            return fig, df_ori
-        
-        else:
-            return df_ori
+
+        return df_ori
 

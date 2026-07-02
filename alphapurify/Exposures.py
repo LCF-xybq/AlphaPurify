@@ -443,13 +443,12 @@ class PortfolioExposures():
                 tickfont=dict(size=8)
             )
         fig.update_yaxes(title_text="Exposure", title_font=dict(size=18), tickfont=dict(size=16))
+        if return_fig:
+            return fig
         if staticPlot:
             fig.show(config={"staticPlot": True, "responsive": True})
         else:
             fig.show(config={"responsive": True})
-
-        if return_fig:
-            return fig
     
     def plot_portfolio_returns(self, staticPlot: bool = False, return_fig: bool = False):
         expo_cols = [col for col in self.result_df.columns if col.endswith("_cum_ret")] 
@@ -493,13 +492,12 @@ class PortfolioExposures():
         fig.update_yaxes(title_text="Exposure", title_font=dict(size=18), tickfont=dict(size=16))
         
         
+        if return_fig:
+            return fig
         if staticPlot:
             fig.show(config={"staticPlot": True, "responsive": True})
         else:
             fig.show(config={"responsive": True})
-
-        if return_fig:
-            return fig
     
     def plot_portfolio_exposures_and_returns(self, staticPlot: bool = False, return_fig: bool = False):
 
@@ -613,13 +611,12 @@ class PortfolioExposures():
             )
         )
         fig.update_layout(base_layout)
+        if return_fig:
+            return fig
         if staticPlot:
             fig.show(config={"staticPlot": True, "responsive": True})
         else:
             fig.show(config={"responsive": True})
-
-        if return_fig:
-            return fig
 
 class PureExposures():
     """
@@ -1032,13 +1029,12 @@ class PureExposures():
                 tickfont=dict(size=8)
             )
         fig.update_yaxes(title_text="Exposure", title_font=dict(size=18), tickfont=dict(size=16))
+        if return_fig:
+            return fig
         if staticPlot:
             fig.show(config={"staticPlot": True, "responsive": True})
         else:
             fig.show(config={"responsive": True})
-
-        if return_fig:
-            return fig
     
     def plot_pure_returns(self, staticPlot: bool = False, return_fig: bool = False):
         expo_cols = [col for col in self.result_df.columns if col.endswith("_cum_ret") or col.endswith("Alpha")] 
@@ -1082,13 +1078,12 @@ class PureExposures():
         fig.update_yaxes(title_text="Exposure", title_font=dict(size=18), tickfont=dict(size=16))
         
         
+        if return_fig:
+            return fig
         if staticPlot:
             fig.show(config={"staticPlot": True, "responsive": True})
         else:
             fig.show(config={"responsive": True})
-
-        if return_fig:
-            return fig
     
     def plot_pure_exposures_and_returns(self, staticPlot: bool = False, return_fig: bool = False):
 
@@ -1202,13 +1197,12 @@ class PureExposures():
             )
         )
         fig.update_layout(base_layout)
+        if return_fig:
+            return fig
         if staticPlot:
             fig.show(config={"staticPlot": True, "responsive": True})
         else:
             fig.show(config={"responsive": True})
-
-        if return_fig:
-            return fig
 
     def plot_correlations(self, staticPlot: bool = False, return_fig: bool = False):
         n_cols = len(self.exposure_cols)
@@ -1418,10 +1412,9 @@ class PureExposures():
         layout_updates.update(legend_layouts)
         fig.update_layout(**layout_updates)
 
+        if return_fig:
+            return fig
         if staticPlot:
             fig.show(config={"staticPlot": True, "responsive": True})
         else:
             fig.show(config={"responsive": True})
-
-        if return_fig:
-            return fig
