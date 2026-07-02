@@ -30,10 +30,10 @@ def _wma(c, h, l, o, v, p): return talib.WMA(c, **p)
 def _dema(c, h, l, o, v, p): return talib.DEMA(c, **p)
 def _tema(c, h, l, o, v, p): return talib.TEMA(c, **p)
 def _kama(c, h, l, o, v, p): return talib.KAMA(c, **p)
-def _mama(c, h, l, o, v, p): return talib.MAMA(c, **p)
-def _midprice(c, h, l, o, v, p): return talib.MIDPRICE(c, **p)
+def _mama(c, h, l, o, v, p): return talib.MAMA(c, **p)[0]
+def _midprice(c, h, l, o, v, p): return talib.MIDPRICE(h, l, **p)
 def _sar(c, h, l, o, v, p): return talib.SAR(h, l, **p)
-def _obv(c, h, l, o, v, p): return talib.OBV(c, **p)
+def _obv(c, h, l, o, v, p): return talib.OBV(c, v, **p)
 def _trima(c, h, l, o, v, p): return talib.TRIMA(c, **p)
 def _t3(c, h, l, o, v, p): return talib.T3(c, **p)
 def _ht_dcperiod(c, h, l, o, v, p): return talib.HT_DCPERIOD(c, **p)
@@ -58,9 +58,9 @@ def _adx(c, h, l, o, v, p): return talib.ADX(h, l, c, **p)
 def _adxr(c, h, l, o, v, p): return talib.ADXR(h, l, c, **p)
 def _dx(c, h, l, o, v, p): return talib.DX(h, l, c, **p)
 def _minus_di(c, h, l, o, v, p): return talib.MINUS_DI(h, l, c, **p)
-def _minus_dm(c, h, l, o, v, p): return talib.MINUS_DM(h, l, c, **p)
+def _minus_dm(c, h, l, o, v, p): return talib.MINUS_DM(h, l, **p)
 def _plus_di(c, h, l, o, v, p): return talib.PLUS_DI(h, l, c, **p)
-def _plus_dm(c, h, l, o, v, p): return talib.PLUS_DM(h, l, c, **p)
+def _plus_dm(c, h, l, o, v, p): return talib.PLUS_DM(h, l, **p)
 def _bop(c, h, l, o, v, p): return talib.BOP(o, h, l, c, **p)
 def _ultosc(c, h, l, o, v, p): return talib.ULTOSC(h, l, c, **p)
 def _mfi(c, h, l, o, v, p): return talib.MFI(h, l, c, v, **p)
@@ -103,7 +103,7 @@ FACTOR_DEFS = [
     ("rocr",             _rocr,             {"timeperiod": 10}),
     ("rocr100",          _rocr100,          {"timeperiod": 10}),
     ("ppo",              _ppo,              {}),
-    ("apo",              _apo,              {"fastperiod": 12, "slowperiod": 26, "signalperiod": 9}),
+    ("apo",              _apo,              {"fastperiod": 12, "slowperiod": 26}),
     ("atr",              _atr,              {"timeperiod": 14}),
     ("natr",             _natr,             {"timeperiod": 14}),
     ("cci",              _cci,              {"timeperiod": 14}),
@@ -207,6 +207,10 @@ def compute_talib_factors(df: pd.DataFrame, factor_indices: list[int]) -> pd.Dat
                                slowd_period=3, slowk_matype=0, slowd_matype=0)
             new_cols["stoch_slowk"] = res[0]
             new_cols["stoch_slowd"] = res[1]
+            res_f = talib.STOCHF(high, low, close,
+                                  fastk_period=5, fastd_period=3, fastd_matype=0)
+            new_cols["stochf_fastk"] = res_f[0]
+            new_cols["stochf_fastd"] = res_f[1]
             continue
 
         if func is None:

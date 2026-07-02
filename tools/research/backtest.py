@@ -12,6 +12,10 @@ fetch_data.py consumes):
 Usage:
     python tools/research/backtest.py --data out.parquet --save ./reports \
         --config data/combination1.yaml
+
+    # Override the primary factor from config
+    python tools/research/backtest.py --data out.parquet --save ./reports \
+        --config data/combination1.yaml --factor my_alpha
 """
 
 import argparse
@@ -162,10 +166,21 @@ def main():
         required=True,
         help="Combination YAML config — supplies factor, winsorize, standardize.",
     )
+    parser.add_argument(
+        "--factor",
+        nargs="*",
+        default=[],
+        help="Override the primary factor from config (first item used). "
+        "Default: empty — read from config's alpha/factor field.",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     factor_name, winsorize, standardize = cfg.factor_name, cfg.winsorize, cfg.standardize
+
+    # CLI --factor overrides config's alpha/factor (first entry used)
+    if args.factor:
+        factor_name = args.factor[0]
 
     df = load_panel(args.data)
     factor_cols = [c for c in df.columns if c not in _META_COLS]
