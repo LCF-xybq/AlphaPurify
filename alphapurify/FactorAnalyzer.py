@@ -2012,7 +2012,11 @@ class FactorAnalyzer():
         ).filter(pl.col(self.trade_date_col).is_not_null()).filter(dates_3_mask)
         
         if df_result.height == 0:
-            raise
+            raise ValueError(
+                f"trace produced no rows for date={date}, period={period}. "
+                f"Likely '{date}' is not on a rebalance date — try a date that "
+                f"falls on the last trading day of the period."
+            )
         return df.filter(dates_4_mask), df_result, dates_4, rebalance_dates
     
     def run_stats_parallel(self):
