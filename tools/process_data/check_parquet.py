@@ -6,7 +6,7 @@ import pandas as pd
 def main():
     parser = argparse.ArgumentParser(description="Display parquet file contents.")
     parser.add_argument("--input", required=True, help="Path to parquet file.")
-    parser.add_argument("--rows", type=int, default=10, help="Number of rows to display.")
+    parser.add_argument("--rows", type=int, default=60, help="Number of rows to display.")
     args = parser.parse_args()
 
     df = pd.read_parquet(args.input)

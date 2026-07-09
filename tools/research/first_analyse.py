@@ -1,12 +1,16 @@
 """
-Quick factor screening — fetch a panel once, compute every candidate TA-Lib
-factor in memory, backtest each one, and keep only those whose Q1→Q{bins}
-mean net returns are perfectly monotonic (ascending or descending).
+Quick factor screening for multi-factor composite candidates — two passes:
 
-No intermediate files are written — the panel lives in memory only.
-Monotonic factors are written to results/first_analyse_factors.yaml.
+  Pass 1 (coarse): keep factors with a weak-but-real signal
+      |IC t-stat| >= IC_T_THRESHOLD  AND  (Q5 - Q1) * IC_mean > 0
+  Pass 2 (decorrelation): greedily drop candidates whose absolute cross-sectional
+  correlation with an already-selected factor exceeds CORR_THRESHOLD, keeping
+  the highest-|t| representative of each cluster.
 
-Edit the globals below to configure the run.
+Output: results/first_analyse_factors.yaml (candidates with selected flag) +
+results/first_analyse_corr.csv (pairwise correlation matrix of pass-1 candidates).
+
+The panel lives in memory only. Edit the globals below to configure the run.
 
 Usage:
     python tools/research/first_analyse.py
@@ -16,6 +20,7 @@ import os
 import sys
 
 import duckdb
+import numpy as np
 import pandas as pd
 import yaml
 
@@ -156,6 +161,8 @@ REBALANCE_PERIODS = ("W",)        # one period is enough for fast screening
 RETURN_HORIZONS = (5,)            # IC horizons — kept minimal for speed
 BINS = 5
 WARMUP_DAYS = 60                  # calendar days pre-fetched for TA-Lib seeding
+IC_T_THRESHOLD = 1.0              # pass-1: min |IC t-stat| for coarse screen
+CORR_THRESHOLD = 0.5              # pass-2: max |corr| allowed with already-selected factor
 
 # Paths
 DB_PATH = os.path.abspath(
@@ -210,9 +217,27 @@ def fetch_panel(db_path: str, codes, start: str, end: str, warmup_days: int) -> 
 
 
 def compute_factors(df: pd.DataFrame, factor_names: list[str]):
-    """Apply TA-Lib factors per symbol. Returns (df, produced_cols)."""
+    """Apply TA-Lib factors per symbol. Returns (df, produced_cols).
+
+    Multi-output factors (BBANDS/MACD/STOCH) share a single root computation
+    index — requesting any sub-column (e.g. stoch_slowd) triggers the whole
+    group so all sibling columns are produced."""
+    from pre_factor import _IDX_BBANDS, _IDX_MACD, _IDX_STOCH
+
     name_to_idx = {n: i for i, (n, _, _) in enumerate(ALL_FACTOR_DEFS)}
-    indices = sorted({name_to_idx[n] for n in factor_names if n in name_to_idx})
+    composite_map = {
+        "bb_upper": _IDX_BBANDS, "bb_middle": _IDX_BBANDS, "bb_lower": _IDX_BBANDS,
+        "macd": _IDX_MACD, "macd_signal": _IDX_MACD, "macd_hist": _IDX_MACD,
+        "stoch_slowk": _IDX_STOCH, "stoch_slowd": _IDX_STOCH,
+        "stochf_fastk": _IDX_STOCH, "stochf_fastd": _IDX_STOCH,
+    }
+    indices = set()
+    for n in factor_names:
+        if n in composite_map:
+            indices.add(composite_map[n])
+        elif n in name_to_idx:
+            indices.add(name_to_idx[n])
+    indices = sorted(indices)
     parts = []
     for _, g in df.groupby("symbol", sort=False):
         g = g.sort_values("datetime")
@@ -228,21 +253,32 @@ def trim_warmup(df: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
     return df[(df["datetime"] >= start_ts) & (df["datetime"] <= end_ts)].reset_index(drop=True)
 
 
-def is_strictly_monotonic(seq: list[float]) -> tuple[bool, str]:
-    """Strict monotonicity check — ascending OR descending both count."""
-    if len(seq) < 2:
-        return False, "none"
-    inc = all(seq[i] < seq[i + 1] for i in range(len(seq) - 1))
-    dec = all(seq[i] > seq[i + 1] for i in range(len(seq) - 1))
-    if inc:
-        return True, "ascending"
-    if dec:
-        return True, "descending"
-    return False, "none"
+def passes_screen(q_means: list[float], ic_mean: float, ic_t: float,
+                  t_threshold: float) -> tuple[bool, str]:
+    """Significance + direction screen.
+
+    Pass when BOTH hold:
+      1. |ic_t| >= t_threshold   (IC is statistically non-trivial)
+      2. (Q5 - Q1) * ic_mean > 0 (extreme-quantile spread agrees with IC sign)
+
+    Returns (passed, direction_or_reason).
+    """
+    if len(q_means) < 2:
+        return False, "no_quantiles"
+    if not np.isfinite(ic_t) or abs(ic_t) < t_threshold:
+        return False, f"weak_t({ic_t:+.2f})"
+    spread = q_means[-1] - q_means[0]
+    if not np.isfinite(spread) or not np.isfinite(ic_mean) or ic_mean == 0:
+        return False, "degenerate"
+    if spread * ic_mean <= 0:
+        return False, "sign_mismatch"
+    return True, "ascending" if spread > 0 else "descending"
 
 
-def backtest_factor(panel: pd.DataFrame, factor_name: str) -> FactorAnalyzer:
-    """Run AlphaPurifier preprocessing + FactorAnalyzer backtest in memory."""
+def backtest_factor(panel: pd.DataFrame, factor_name: str) -> tuple[FactorAnalyzer, pd.DataFrame]:
+    """Run AlphaPurifier preprocessing + FactorAnalyzer backtest in memory.
+    Returns (fa, proc) — proc is the preprocessed panel (used later for the
+    cross-sectional correlation matrix)."""
     pre = AlphaPurifier(
         panel, factor_name=factor_name, trade_date_col="datetime", symbol_col="symbol"
     )
@@ -266,7 +302,63 @@ def backtest_factor(panel: pd.DataFrame, factor_name: str) -> FactorAnalyzer:
         analysis_cfg=AnalysisConfig(),
     )
     fa.run()
-    return fa
+    return fa, proc
+
+
+def compute_factor_corr_matrix(proc_dict: dict, factor_names: list[str]) -> pd.DataFrame:
+    """Average cross-sectional Spearman correlation between candidate factors.
+
+    proc_dict[factor] = preprocessed panel with columns [datetime, symbol, factor].
+    For each date, ranks each factor cross-sectionally, computes pairwise rank
+    correlation (= Spearman), then averages across dates.
+    """
+    if len(factor_names) < 2:
+        return pd.DataFrame()
+
+    # Build a wide panel: [datetime, symbol, factor_1, factor_2, ...]
+    cols = {}
+    for f in factor_names:
+        p = proc_dict[f][["datetime", "symbol", f]].rename(columns={f: f"_r_{f}"})
+        cols[f] = p
+    merged = cols[factor_names[0]]
+    for f in factor_names[1:]:
+        merged = merged.merge(cols[f], on=["datetime", "symbol"], how="outer")
+
+    # Rank each factor within each date (cross-sectional rank)
+    rank_cols = [f"_r_{f}" for f in factor_names]
+    for c in rank_cols:
+        merged[c] = merged.groupby("datetime")[c].rank()
+
+    # Per-date correlation matrix, then average across dates
+    corr_per_date = merged.groupby("datetime")[rank_cols].corr()
+    avg_corr = (
+        corr_per_date.stack()
+        .groupby(level=[1, 2]).mean()
+        .unstack()
+    )
+    avg_corr = avg_corr.reindex(index=rank_cols, columns=rank_cols)
+    avg_corr.index = factor_names
+    avg_corr.columns = factor_names
+    return avg_corr
+
+
+def greedy_decorrelate(corr_matrix: pd.DataFrame, factors_in_order: list[str],
+                       threshold: float) -> list[str]:
+    """Greedily keep factors, skipping any with |corr| > threshold vs. an
+    already-selected factor. Input order determines priority (highest |t| first)."""
+    selected: list[str] = []
+    for f in factors_in_order:
+        if f not in corr_matrix.index:
+            continue
+        too_correlated = False
+        for s in selected:
+            c = corr_matrix.loc[f, s]
+            if pd.notna(c) and abs(c) > threshold:
+                too_correlated = True
+                break
+        if not too_correlated:
+            selected.append(f)
+    return selected
 
 
 def extract_quantile_means(fa: FactorAnalyzer) -> dict:
@@ -296,9 +388,32 @@ def extract_ls_stats(fa: FactorAnalyzer) -> dict:
     return out
 
 
+def extract_ic_stats(fa: FactorAnalyzer) -> dict:
+    """Per horizon: pull IC mean / t-stat / p-value / IR from ic_stats_panel."""
+    out = {}
+    panel = fa.ic_stats_panel
+    if panel is None or len(panel) == 0:
+        return out
+    for _, row in panel.iterrows():
+        h = row.get("period")
+        try:
+            h_key = int(h)
+        except (TypeError, ValueError):
+            h_key = h
+        out[h_key] = {
+            "ic_mean": float(row.get("Mean Rank IC", float("nan"))),
+            "ic_t": float(row.get("t-stat", float("nan"))),
+            "ic_pvalue": float(row.get("p-Value", float("nan"))),
+            "ic_ir": float(row.get("IR", float("nan"))),
+        }
+    return out
+
+
 def main():
     print(f"[screen] symbols: {len(CODES)}  range: [{START_DATE}, {END_DATE}]")
     print(f"[screen] factors: {len(FACTORS)}  bins: {BINS}  rebalance: {REBALANCE_PERIODS}")
+    print(f"[screen] pass 1: |IC t|>={IC_T_THRESHOLD} AND (Q5-Q1)*IC>0")
+    print(f"[screen] pass 2: greedy decorrelate at |corr|<={CORR_THRESHOLD}")
 
     df = fetch_panel(DB_PATH, CODES, START_DATE, END_DATE, WARMUP_DAYS)
     print(f"[screen] panel rows={len(df)}  (incl. {WARMUP_DAYS}d warmup)")
@@ -313,34 +428,107 @@ def main():
         print(f"[screen] WARNING: factors not produced (skipped): {dropped}")
     print(f"[screen] backtesting {len(usable)} factors ...\n")
 
-    results = []
+    # ---------- Pass 1: coarse screen ----------
+    candidates = []      # list of dicts: factor, ic_t, ic_mean, periods
+    proc_dict = {}       # factor -> preprocessed panel (kept for pass 2)
     for i, factor_name in enumerate(usable, 1):
         try:
-            fa = backtest_factor(df, factor_name)
+            fa, proc = backtest_factor(df, factor_name)
         except Exception as e:  # per-factor failure should not abort the screen
             print(f"[screen] ({i}/{len(usable)}) {factor_name:<22} ERROR: {e}")
             continue
 
         q_means = extract_quantile_means(fa)
         ls_stats = extract_ls_stats(fa)
+        ic_stats = extract_ic_stats(fa)
 
-        monotonic_periods = []
+        horizons = sorted(ic_stats.keys())
+        h_key = horizons[0] if horizons else None
+        ic_info = ic_stats.get(h_key, {})
+        ic_mean = ic_info.get("ic_mean", float("nan"))
+        ic_t = ic_info.get("ic_t", float("nan"))
+
+        passed_periods = []
         for period, means in q_means.items():
-            ok, direction = is_strictly_monotonic(means)
+            ok, direction = passes_screen(means, ic_mean, ic_t, IC_T_THRESHOLD)
             if not ok:
                 continue
-            monotonic_periods.append({
+            passed_periods.append({
                 "period": str(period),
                 "direction": direction,
+                "ic_horizon": h_key,
+                "ic_mean": ic_mean,
+                "ic_t": ic_t,
+                "ic_pvalue": ic_info.get("ic_pvalue"),
+                "ic_ir": ic_info.get("ic_ir"),
                 "quantile_means": {f"Q{q + 1}": means[q] for q in range(len(means))},
                 **ls_stats.get(period, {}),
             })
 
-        tag = f"MONO[{','.join(p['period'] for p in monotonic_periods)}]" if monotonic_periods else "----"
+        if passed_periods:
+            tag = f"PASS[{','.join(p['period'] for p in passed_periods)},t={ic_t:+.2f}]"
+        else:
+            first_period = next(iter(q_means), None)
+            if first_period is not None:
+                _, reason = passes_screen(
+                    q_means[first_period], ic_mean, ic_t, IC_T_THRESHOLD
+                )
+                tag = f"FAIL[{reason}]"
+            else:
+                tag = "FAIL[no_data]"
         print(f"[screen] ({i}/{len(usable)}) {factor_name:<22} {tag}")
 
-        if monotonic_periods:
-            results.append({"factor": factor_name, "periods": monotonic_periods})
+        if passed_periods:
+            candidates.append({
+                "factor": factor_name,
+                "ic_t": ic_t,
+                "ic_mean": ic_mean,
+                "periods": passed_periods,
+            })
+            proc_dict[factor_name] = proc
+
+    print(f"\n[screen] pass 1: {len(candidates)}/{len(usable)} candidates")
+
+    # ---------- Pass 2: greedy decorrelation ----------
+    selected: list[str] = []
+    corr_matrix = pd.DataFrame()
+    if len(candidates) >= 1:
+        # Order candidates by |ic_t| descending — priority for greedy selection
+        ordered = sorted(candidates, key=lambda c: abs(c["ic_t"]), reverse=True)
+        ordered_names = [c["factor"] for c in ordered]
+        if len(ordered_names) >= 2:
+            corr_matrix = compute_factor_corr_matrix(proc_dict, ordered_names)
+            corr_path = os.path.splitext(OUTPUT_PATH)[0] + "_corr.csv"
+            corr_matrix.to_csv(corr_path)
+            print(f"[screen] correlation matrix -> {corr_path}")
+            selected = greedy_decorrelate(corr_matrix, ordered_names, CORR_THRESHOLD)
+        else:
+            selected = ordered_names
+
+        print(f"[screen] pass 2: {len(selected)}/{len(candidates)} kept after decorrelation")
+        for c in ordered:
+            mark = "KEEP" if c["factor"] in selected else "drop"
+            extra = ""
+            if c["factor"] not in selected:
+                # find the kept factor that triggered the drop
+                for s in selected:
+                    cv = corr_matrix.loc[c["factor"], s] if not corr_matrix.empty else float("nan")
+                    if pd.notna(cv) and abs(cv) > CORR_THRESHOLD:
+                        extra = f"  (corr={cv:+.2f} with {s})"
+                        break
+            print(f"   [{mark}] {c['factor']:<22} t={c['ic_t']:+.2f}{extra}")
+
+    # ---------- Write YAML ----------
+    selected_set = set(selected)
+    ordered = sorted(candidates, key=lambda c: abs(c["ic_t"]), reverse=True)
+    factors_payload = []
+    for c in ordered:
+        if c["factor"] not in selected_set:
+            continue
+        factors_payload.append({
+            "factor": c["factor"],
+            "periods": c["periods"],
+        })
 
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
     payload = {
@@ -353,15 +541,24 @@ def main():
             "return_horizons": list(RETURN_HORIZONS),
             "winsorize": WINSORIZE,
             "standardize": STANDARDIZE,
+            "pass_1": {
+                "rule": "|IC t| >= threshold AND (Q5-Q1) * IC_mean > 0",
+                "ic_t_threshold": IC_T_THRESHOLD,
+                "n_candidates": len(candidates),
+            },
+            "pass_2": {
+                "rule": "greedy decorrelate, keep highest |t| per cluster",
+                "corr_threshold": CORR_THRESHOLD,
+                "n_selected": len(selected),
+            },
             "n_screened": len(usable),
-            "n_monotonic": len(results),
         },
-        "factors": results,
+        "factors": factors_payload,
     }
     with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
         yaml.safe_dump(payload, f, sort_keys=False, allow_unicode=True)
 
-    print(f"\n[screen] done. {len(results)}/{len(usable)} monotonic -> {OUTPUT_PATH}")
+    print(f"\n[screen] done. {len(selected)}/{len(usable)} selected -> {OUTPUT_PATH}")
 
 
 if __name__ == "__main__":
