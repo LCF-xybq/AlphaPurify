@@ -1,28 +1,40 @@
 """
 Fetch OHLCV panel data from the local DuckDB store, attach daily valuation,
 quarterly fundamentals (point-in-time), industry classification, and compute
-TA-Lib factors according to a YAML combination config.
+factors according to a YAML combination config.
+
+Two factor sources are supported:
+  - Alpha191 formulas (factors/alpha191.py): triggered when `alpha:` contains
+    "all" or 3-digit ids like "001", "189". Needs `amount` in addition to
+    OHLCV (auto-fetched).
+  - TA-Lib indicators (legacy): triggered when `alpha:` contains TA-Lib names
+    like "sma", "rsi", "macd". Same behavior as before.
 
 Usage:
-    python tools/research/fetch_data.py --config data/combination1.yaml --save out.parquet
+    python tools/research/fetch_data.py --config data/all_factors.yaml \\
+        --save data/all_factors.parquet --warmup 400
+
+    # Optional external factors for Alpha030/075/149/181/182:
+    --ff3 data/ff3.parquet --benchmark data/benchmark.parquet
 
 Config layout (see data/all_factors.yaml):
     codes:                     [sh.601991, sz.002491, ...]
     date:                      [{start: "2024-01-01", end: "2026-07-03"}]
-    alpha:                     [sma, macd]                # TA-Lib factors
-    exposure:                  [rsi, cmo, mom]            # optional, same as alpha
-    include_fundamentals: true # join stock_fundamental via PIT pub_date merge
-    include_valuation:     true # join stock_valuation_d (peTTM/pb/psTTM/isST)
-    drop_st:               true # alias for the implicit isST!=1 filter applied at
-                                # fetch time in stock_kline_d; kept for explicit intent
+    alpha:                     [all]              # Alpha191 mode
+                                 # OR [sma, macd]  # TA-Lib mode
+    exposure:                  [...]              # optional, same logic as alpha
+    include_fundamentals: true
+    include_valuation:     true
+    drop_st:               true
 
 Output columns:
-    datetime, symbol, close, volume, <TA-Lib cols>, <fundamental cols>,
-    <valuation cols>, industry
+    datetime, symbol, open, high, low, close, volume, amount,
+    <factor cols>, <fundamental cols>, <valuation cols>, industry
 """
 
 import argparse
 import os
+import re
 import sys
 
 import duckdb
@@ -33,6 +45,12 @@ import yaml
 _PROCESS_DIR = os.path.join(os.path.dirname(__file__), "..", "process_data")
 sys.path.insert(0, os.path.abspath(_PROCESS_DIR))
 from pre_factor import ALL_FACTOR_DEFS, compute_talib_factors  # noqa: E402
+
+# Alpha191 factor library (project-local)
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+from factors import compute_alpha_factors, ALPHA191_REGISTRY  # noqa: E402
 
 NAME_TO_IDX = {name: i for i, (name, _, _) in enumerate(ALL_FACTOR_DEFS)}
 
@@ -118,6 +136,42 @@ def resolve_factor_indices(factor_names):
     return sorted(set(indices))
 
 
+_ALPHA191_ID_RE = re.compile(r"^\d{1,3}$")
+
+
+def is_alpha191_mode(factor_names) -> bool:
+    """True if the alpha list looks like Alpha191 ids ("all" or 3-digit numbers)."""
+    if not factor_names:
+        return False
+    for raw in factor_names:
+        s = str(raw).strip().lower()
+        if s == "all":
+            return True
+        # Strip optional "alpha191_" prefix
+        if s.startswith("alpha191_"):
+            s = s[len("alpha191_"):]
+        if _ALPHA191_ID_RE.match(s):
+            return True
+    return False
+
+
+def resolve_alpha191_names(factor_names) -> list[str] | None:
+    """Return explicit alpha191 ids, or None for "all".
+    Raises ValueError on unknown ids."""
+    if any(str(s).strip().lower() == "all" for s in factor_names):
+        return None
+    out = []
+    for raw in factor_names:
+        s = str(raw).strip().lower()
+        if s.startswith("alpha191_"):
+            s = s[len("alpha191_"):]
+        s = s.zfill(3)
+        if s not in ALPHA191_REGISTRY:
+            raise ValueError(f"Unknown alpha191 id '{raw}'. Valid: 001..191")
+        out.append(s)
+    return sorted(set(out))
+
+
 def _table_exists(con, table_name: str) -> bool:
     return con.execute(
         "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?",
@@ -185,10 +239,11 @@ def fetch_panel(
 
     con = duckdb.connect(db_path, read_only=True)
     try:
-        # 1. OHLCV (stock_kline_d already excludes isST=1 rows — filtering happens
-        # at fetch time in core/data/stock.py, so no explicit ST filter needed here.)
+        # 1. OHLCV+amount (stock_kline_d already excludes isST=1 rows — filtering
+        # happens at fetch time in core/data/stock.py, so no explicit ST filter
+        # needed here. `amount` is required by Alpha191 VWAP derivation.)
         df = con.execute(f"""
-            SELECT code, date, open, high, low, close, volume
+            SELECT code, date, open, high, low, close, volume, amount
             FROM {_TABLE}
             WHERE code IN ({codes_literal})
               AND date >= DATE '{fetch_start}'
@@ -259,6 +314,15 @@ def compute_factors(df: pd.DataFrame, factor_indices):
     return out, produced
 
 
+def compute_alpha191(df: pd.DataFrame, names: list[str] | None, ctx: dict | None = None):
+    """Apply Alpha191 factors to the full panel (cross-sectional ops need it).
+    Returns (df_aug, produced_cols)."""
+    out = compute_alpha_factors(df, names=names, ctx=ctx, skip_on_error=True)
+    prefix = "alpha191_"
+    produced = [c for c in out.columns if c.startswith(prefix)]
+    return out, produced
+
+
 def save_panel(df: pd.DataFrame, path: str):
     ext = os.path.splitext(path)[1].lower()
     out_dir = os.path.dirname(os.path.abspath(path)) or "."
@@ -273,7 +337,7 @@ def save_panel(df: pd.DataFrame, path: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fetch stock panel data and compute TA-Lib factors from a YAML combination config."
+        description="Fetch stock panel data and compute factors (Alpha191 or TA-Lib) from a YAML config."
     )
     parser.add_argument("--config", required=True, help="YAML config path.")
     parser.add_argument("--save", required=True, help="Output file (.parquet or .csv).")
@@ -285,23 +349,37 @@ def main():
     parser.add_argument(
         "--warmup",
         type=int,
-        default=60,
+        default=400,
         help=(
             "Calendar days to pre-fetch before `start` for factor warmup "
-            "(default 60, covering SMA(20), MACD(26), etc.). "
-            "These rows are used to seed factor values and then trimmed."
+            "(default 400, covers Alpha191's longest window SUM(RET,250) + buffer). "
+            "60 is enough for TA-Lib-only configs."
         ),
     )
+    parser.add_argument("--ff3", default=None,
+                        help="Optional parquet with mkt/smb/hml columns for Alpha030/147/181/182.")
+    parser.add_argument("--benchmark", default=None,
+                        help="Optional parquet with open/close columns for benchmark-index alphas.")
     args = parser.parse_args()
 
     codes, start, end, alpha_list, exposure_list, opts = load_config(args.config)
     factor_list = list(alpha_list) + list(exposure_list)
-    factor_indices = resolve_factor_indices(factor_list)
     print(f"[fetch] symbols: {len(codes)}  range: [{start}, {end}]")
     print(f"[fetch] alpha:    {alpha_list}")
     print(f"[fetch] exposure: {exposure_list}")
     print(f"[fetch] include_fundamentals={opts['include_fundamentals']}  "
           f"include_valuation={opts['include_valuation']}  drop_st={opts['drop_st']}")
+
+    # Branch on factor source: Alpha191 vs TA-Lib
+    alpha191_mode = is_alpha191_mode(factor_list)
+    talib_indices = None
+    a191_names = None
+    if alpha191_mode:
+        a191_names = resolve_alpha191_names(factor_list)
+        print(f"[fetch] factor source: Alpha191 ({'all 191' if a191_names is None else len(a191_names)} selected)")
+    else:
+        talib_indices = resolve_factor_indices(factor_list)
+        print(f"[fetch] factor source: TA-Lib ({len(talib_indices)} factors)")
 
     db_path = os.path.abspath(args.db) if args.db else _DEFAULT_DB
     df = fetch_panel(
@@ -313,15 +391,20 @@ def main():
     )
     print(f"[fetch] panel rows={len(df)}  symbols={df['symbol'].nunique()}  (incl. {args.warmup}d warmup)")
 
-    df, produced = compute_factors(df, factor_indices)
+    if alpha191_mode:
+        ctx = _load_ctx(args.ff3, args.benchmark, df)
+        df, produced = compute_alpha191(df, a191_names, ctx)
+    else:
+        df, produced = compute_factors(df, talib_indices)
 
     # Trim warmup rows — output only the requested [start, end] window
     start_ts = pd.to_datetime(start)
     end_ts = pd.to_datetime(end)
     df = df[(df["datetime"] >= start_ts) & (df["datetime"] <= end_ts)].reset_index(drop=True)
 
-    # Build final column list: meta + TA-Lib produced + fundamental + valuation + industry
-    keep = ["datetime", "symbol", "close", "volume"]
+    # Build final column list: meta + factors + fundamental + valuation + industry
+    keep = ["datetime", "symbol", "open", "high", "low", "close", "volume", "amount"]
+    keep = [c for c in keep if c in df.columns]
     keep += [c for c in produced if c in df.columns]
     if opts["include_fundamentals"]:
         keep += [c for c in _FUNDAMENTAL_COLS if c in df.columns]
@@ -336,6 +419,20 @@ def main():
 
     save_panel(df, args.save)
     print(f"[fetch] saved -> {args.save}  ({len(df)} rows, {len(df.columns)} cols)")
+
+
+def _load_ctx(ff3_path: str | None, benchmark_path: str | None, panel: pd.DataFrame) -> dict | None:
+    """Load optional external factors and align to the panel's index."""
+    if not ff3_path and not benchmark_path:
+        return None
+    from factors.data import load_external
+    # Build MultiIndex reference
+    tmp = panel[["symbol", "datetime"]].copy()
+    tmp["symbol"] = tmp["symbol"].astype(str)
+    tmp["datetime"] = pd.to_datetime(tmp["datetime"])
+    ref_index = pd.MultiIndex.from_arrays([tmp["symbol"].values, tmp["datetime"].values],
+                                          names=["symbol", "datetime"])
+    return load_external(ff3_path, benchmark_path, ref_index)
 
 
 if __name__ == "__main__":

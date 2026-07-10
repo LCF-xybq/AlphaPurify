@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 
 # Columns considered metadata, not factors
-_META_COLS = {"datetime", "symbol", "open", "high", "low", "close", "volume", "industry"}
+_META_COLS = {"datetime", "symbol", "open", "high", "low", "close", "volume", "amount", "industry"}
 
 
 @dataclass
@@ -80,11 +80,11 @@ def generate_walkforward_splits(
     min_train_months: int = 6,
     purge_days: int = 5,
     embargo_days: int = 5,
+    train_window_months: int | None = None,
 ) -> Iterator[tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]]:
     """Yield (train_start, train_end_inclusive, test_start, test_end_inclusive)
     tuples in calendar dates.
 
-    - Train is expanding: train_start is fixed at panel start.
     - First test month begins after `min_train_months` of training data.
     - purge_days and embargo_days are in TRADING DAYS (not calendar days),
       because forward-return labels look `horizon` trading days ahead —
@@ -95,6 +95,10 @@ def generate_walkforward_splits(
       strictly before the test month.
     - test_start = first trading day of test month + `embargo_days` trading days.
     - test_end_inclusive = last trading day of test month.
+    - train_window_months: None = expanding (train_start fixed at panel start,
+      default). If int (e.g. 6), train_start rolls forward — only the trailing
+      N months before the test month are used as training data. Rolling adapts
+      faster to regime changes at the cost of fewer training rows per window.
     """
     trading_days = pd.DatetimeIndex(sorted(panel["datetime"].unique()))
     if len(trading_days) == 0:
@@ -127,10 +131,28 @@ def generate_walkforward_splits(
             continue
         train_end = td_list[first_test_pos - purge_days - 1]
 
-        if train_end < panel_start + pd.Timedelta(days=30 * min_train_months - 5):
-            continue
+        # Train start: expanding (panel_start) OR rolling N months back
+        if train_window_months is None:
+            train_start = panel_start
+            # In expanding mode, gate the first test month on min_train_months
+            if train_end < panel_start + pd.Timedelta(days=30 * min_train_months - 5):
+                continue
+        else:
+            # In rolling mode, train_window_months itself is the gate. We just
+            # need to make sure the rolling-start month index is valid; if it
+            # would go negative, clamp to 0 (effectively expanding for the
+            # first few windows until enough months accumulate).
+            win_start_idx = max(0, i - train_window_months)
+            win_year, win_month = months[win_start_idx]
+            win_start = pd.Timestamp(year=win_year, month=win_month, day=1)
+            win_start_days = trading_days[trading_days >= win_start]
+            train_start = win_start_days[0] if len(win_start_days) else panel_start
+            # Skip only if we haven't accumulated min_train_months of panel
+            # data yet (so the very first eligible test month is still gated).
+            if i < min_train_months:
+                continue
 
-        yield panel_start, train_end, test_start, test_end
+        yield train_start, train_end, test_start, test_end
 
 
 # =============================================================================
@@ -209,8 +231,19 @@ def fit_preprocessor(train_df: pd.DataFrame, factor_cols: list[str],
 
 
 def transform(df: pd.DataFrame, prep: Preprocessor,
-              industry_col: str = "industry") -> pd.DataFrame:
-    """Apply winsorize + industry-neutralize + zscore using fitted prep."""
+              industry_col: str = "industry",
+              date_col: str = "datetime",
+              rank_transform: bool = False) -> pd.DataFrame:
+    """Apply winsorize + industry-neutralize + (zscore OR per-date rank).
+
+    When rank_transform=True, the final step replaces zscore with per-date
+    cross-sectional percentile rank in (0, 1). Rank features have stable
+    scale across dates but lose magnitude information — empirically this
+    HURTS LightGBM IC on the alpha191 panel (zscore wins by ~25% on t-stat)
+    because LightGBM trains on continuous labels and benefits from the
+    magnitude signal. Default is zscore (False); rank_transform is kept as
+    an option for experimentation.
+    """
     clip_lo = prep.median - prep.winsorize_k * prep.mad
     clip_hi = prep.median + prep.winsorize_k * prep.mad
     out = df.copy()
@@ -226,8 +259,11 @@ def transform(df: pd.DataFrame, prep: Preprocessor,
         if has_industry:
             mapped = ind_series.map(prep.industry_means[f]).fillna(0.0)
             out[f] = out[f].values - mapped.values
-        # 3. Zscore
-        out[f] = (out[f] - prep.mean[f]) / prep.std[f]
+        # 3. Standardize: zscore (when rank_transform=False) or per-date rank
+        if rank_transform:
+            out[f] = out.groupby(date_col)[f].rank(pct=True, method="average")
+        else:
+            out[f] = (out[f] - prep.mean[f]) / prep.std[f]
     return out
 
 
@@ -242,6 +278,8 @@ def build_splits(
     purge_days: int = 5,
     embargo_days: int = 5,
     winsorize_k: float = 5.0,
+    rank_transform: bool = False,
+    train_window_months: int | None = None,
 ) -> Iterator[WindowSplit]:
     """Yield fully preprocessed WindowSplit objects.
 
@@ -256,6 +294,7 @@ def build_splits(
     for train_start, train_end, test_start, test_end in generate_walkforward_splits(
         panel, min_train_months=min_train_months,
         purge_days=purge_days, embargo_days=embargo_days,
+        train_window_months=train_window_months,
     ):
         train_mask = (panel["datetime"] >= train_start) & (panel["datetime"] <= train_end)
         test_mask = (panel["datetime"] >= test_start) & (panel["datetime"] <= test_end)
@@ -265,13 +304,16 @@ def build_splits(
             continue
 
         prep = fit_preprocessor(train_raw, factor_cols, winsorize_k=winsorize_k)
-        train_proc = transform(train_raw, prep)
-        test_proc = transform(test_raw, prep)
+        train_proc = transform(train_raw, prep, rank_transform=rank_transform)
+        test_proc = transform(test_raw, prep, rank_transform=rank_transform)
 
-        # Drop rows where label is NaN (last `horizon` days of panel + any
-        # NaN introduced by preprocessing)
-        train_proc = train_proc.dropna(subset=factor_cols + [label_col])
-        test_proc = test_proc.dropna(subset=factor_cols + [label_col])
+        # Drop rows where LABEL is NaN (last `horizon` days of panel).
+        # Feature NaN is left in place — LightGBM handles it natively, and
+        # dropping rows on any-feature-NaN would discard most of the panel
+        # once alpha191's long-window formulas (SUM(RET,250), CORR(..,230))
+        # are in the feature set.
+        train_proc = train_proc.dropna(subset=[label_col])
+        test_proc = test_proc.dropna(subset=[label_col])
 
         yield WindowSplit(
             train=train_proc,

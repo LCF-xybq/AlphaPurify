@@ -261,33 +261,15 @@ def process_file(filepath: str, factor_indices: list[int], timeout: int = 300) -
 
 
 def process_file_alpha(filepath: str, timeout: int = 300) -> dict:
-    """Process a single file: read, compute alpha factors, write back."""
-    from core.factor.alpha import compute_alpha_factors
-
-    ext = os.path.splitext(filepath)[1].lower()
-
-    try:
-        if ext == ".parquet":
-            df = pd.read_parquet(filepath)
-        elif ext == ".csv":
-            df = pd.read_csv(filepath)
-        else:
-            return {"file": filepath, "status": "skipped", "reason": "unsupported format"}
-
-        if "symbol" not in df.columns or "datetime" not in df.columns:
-            return {"file": filepath, "status": "skipped", "reason": "missing symbol/datetime column"}
-
-        df = compute_alpha_factors(df)
-
-        if ext == ".csv":
-            df.to_csv(filepath, index=False)
-        elif ext == ".parquet":
-            df.to_parquet(filepath, index=False)
-
-        return {"file": filepath, "status": "success", "rows": len(df), "cols": len(df.columns)}
-
-    except Exception as e:
-        return {"file": filepath, "status": "error", "reason": str(e)}
+    """Legacy per-file alpha hook (kept for backward compatibility).
+    DEPRECATED: most Alpha191 formulas need cross-sectional RANK and cannot be
+    computed per-file. Use the panel-mode `--src factors` path instead, which
+    merges all files in --input into one panel before computing.
+    """
+    raise RuntimeError(
+        "process_file_alpha is deprecated — alpha191 needs panel mode. "
+        "Use the main() --src factors path which calls factors.process_panel_dir."
+    )
 
 
 def main():
@@ -302,10 +284,14 @@ def main():
     parser.add_argument(
         "--factor",
         required=True,
-        help="Factor name(s) to compute. Use 'all' for all TA-Lib factors, or comma-separated list (e.g., 'rsi,macd,atr').",
+        help="Factor name(s) to compute. Use 'all' for all TA-Lib factors, or comma-separated list (e.g., 'rsi,macd,atr'). "
+             "In --src factors mode, use alpha191 numbers (e.g., '001,002' or 'all').",
     )
     parser.add_argument("--workers", type=int, default=8, help="Number of parallel workers.")
     parser.add_argument("--timeout", type=int, default=300, help="Timeout per file in seconds.")
+    # Alpha191 panel-mode options
+    parser.add_argument("--ff3", default=None, help="Optional parquet with MKT/SMB/HML columns for Alpha030/147/149/181/182.")
+    parser.add_argument("--benchmark", default=None, help="Optional parquet with open/close columns for benchmark-index alphas.")
     args = parser.parse_args()
 
     # Collect files
@@ -316,30 +302,48 @@ def main():
     if not all_files:
         raise FileNotFoundError(f"No CSV or Parquet files found in {args.input}")
 
-    # === Alpha factors mode ===
+    # === Alpha factors mode (panel: merge all files -> compute -> split back) ===
     if args.src == "factors":
-        print(f"Computing alpha factors (turnover, momentum, volatility, VP divergence)")
-        print(f"Found {len(all_files)} files, processing with {args.workers} workers...")
+        # Resolve the requested alpha191 numbers
+        import sys
+        sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+        from factors import process_panel_dir, ALPHA191_REGISTRY
 
-        success, errors, skipped = 0, 0, 0
-        ctx = mp.get_context("spawn")
-        with ProcessPoolExecutor(max_workers=args.workers, mp_context=ctx) as executor:
-            futures = {
-                executor.submit(process_file_alpha, f, args.timeout): f
-                for f in all_files
-            }
-            for future in as_completed(futures, timeout=args.timeout * len(all_files) / args.workers + 60):
-                result = future.result(timeout=args.timeout)
-                if result["status"] == "success":
-                    success += 1
-                    print(f"[OK] {result['file']} ({result['rows']} rows, {result['cols']} cols)")
-                elif result["status"] == "skipped":
-                    skipped += 1
-                else:
-                    errors += 1
-                    print(f"[ERR] {result['file']}: {result['reason']}")
+        if args.factor.lower() == "all":
+            names = None
+        else:
+            names = []
+            for s in args.factor.split(","):
+                s = s.strip()
+                if s.lower().startswith("alpha191_"):
+                    s = s[len("alpha191_"):]
+                names.append(s.zfill(3))
+            unknown = [n for n in names if n not in ALPHA191_REGISTRY]
+            if unknown:
+                raise ValueError(f"Unknown alpha191 ids: {unknown}")
 
-        print(f"\nDone: {success} succeeded, {skipped} skipped, {errors} failed")
+        # Build ctx from optional external data files
+        ctx = None
+        if args.ff3 or args.benchmark:
+            from factors.data import load_external
+            # Need a placeholder index; load_external aligns to a MultiIndex reference
+            # but here we don't have one yet — pass paths and let process_panel_dir
+            # call load_external with the panel's index. For simplicity, we don't
+            # support external data via CLI yet; user can pass ctx via Python API.
+            print("[factors] NOTE: --ff3 / --benchmark CLI args require panel-mode loading.")
+            print("[factors] External-data alphas (030/075/149/181/182) will be skipped.")
+            ctx = None
+
+        print(f"Computing Alpha191 factors ({'all 191' if names is None else len(names)} selected)")
+        print(f"Found {len(all_files)} files. Panel-mode: merging, computing, splitting back.")
+        result = process_panel_dir(args.input, factor_names=names, ctx=ctx)
+        print(f"\nDone: {result['success']} succeeded")
+        if result["skipped"]:
+            print(f"Skipped {len(result['skipped'])} file(s): {result['skipped']}")
+        if result["errors"]:
+            print(f"Errors: {result['errors']}")
+        if result["alpha_skipped"]:
+            print(f"All-NaN alpha columns (likely missing external data): {result['alpha_skipped']}")
         return
 
     # === TA-Lib mode (default) ===
